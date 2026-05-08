@@ -129,7 +129,24 @@ export async function triggerBuild(repo: string, branch: string): Promise<BuildR
   let allError = '';
   let success = true;
 
-  // Step 1: fetch + checkout the target branch
+  // Step 1: auto-stash local changes if worktree is dirty
+  const currentBranchResult = await runCommand('git', ['rev-parse', '--abbrev-ref', 'HEAD'], repoPath);
+  const currentBranch = currentBranchResult.code === 0 ? currentBranchResult.stdout.trim() : 'unknown';
+
+  const status = await runCommand('git', ['status', '--porcelain'], repoPath);
+  if (status.code === 0 && status.stdout.trim()) {
+    const stashMessage = `mcp-auto-stash:${new Date().toISOString()}:${currentBranch}`;
+    console.log(`[build] dirty worktree detected on ${currentBranch}, stashing changes`);
+    const stash = await runCommand('git', ['stash', 'push', '-u', '-m', stashMessage], repoPath);
+    allOutput += `=== git stash (auto) ===\n${stash.stdout}`;
+    allError += stash.stderr;
+    if (stash.code !== 0) {
+      success = false;
+      allError += `\ngit stash failed with exit code ${stash.code}`;
+    }
+  }
+
+  // Step 2: fetch + checkout the target branch
   console.log(`[build] git fetch origin ${branch} in ${repoPath}`);
   const fetch = await runCommand('git', ['fetch', 'origin', branch], repoPath);
   allOutput += `=== git fetch ===\n${fetch.stdout}`;
@@ -144,7 +161,7 @@ export async function triggerBuild(repo: string, branch: string): Promise<BuildR
     allError += `\ngit checkout failed with exit code ${checkout.code}`;
   }
 
-  // Step 2: dotnet build related solutions
+  // Step 3: dotnet build related solutions
   if (success) {
     const allSlns = findAllSlnFiles(repoPath);
     const changedFiles = await getChangedFiles(repoPath);

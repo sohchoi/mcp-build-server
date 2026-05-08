@@ -195,6 +195,7 @@ Once the server is running, ask Copilot CLI:
 
 **Wrong branch built**
 - The server always does `git fetch origin <branch>` + `git checkout -B <branch> origin/<branch>` before building
+- If the VDI repo has uncommitted changes, the server auto-stashes them first (`git stash push -u`) and then switches to the pushed branch
 
 **Admin.sln GUID error (MSB4051)**
 - A project is referenced in the solution but missing from the `.sln` file
