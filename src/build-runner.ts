@@ -27,6 +27,194 @@ export function listRepos(): string[] {
     .map((d) => d.name);
 }
 
+const CSPROJ_TYPE_GUID = 'FAE04EC0-301F-11D3-BF4B-00C04F79EFBC';
+const SOLUTION_FOLDER_TYPE_GUID = '2150E333-8FDC-42A3-9474-1A3956D46DE8';
+
+interface CsprojInfo {
+  projectName: string;
+  projectPath: string;
+  projectGuid: string;
+}
+
+function normalizeGuid(guid: string): string {
+  return guid.replace(/[{}]/g, '').toUpperCase();
+}
+
+function toGuidLiteral(guid: string): string {
+  return `{${normalizeGuid(guid)}}`;
+}
+
+function findCsprojFiles(repoPath: string): string[] {
+  const SKIP_DIRS = new Set(['node_modules', '.git', 'bin', 'obj', 'packages']);
+  const results: string[] = [];
+
+  function walk(dir: string, depth: number) {
+    if (depth > 8) return;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory() && !entry.name.startsWith('.') && !SKIP_DIRS.has(entry.name)) {
+        walk(full, depth + 1);
+      } else if (entry.isFile() && entry.name.endsWith('.csproj')) {
+        results.push(full);
+      }
+    }
+  }
+
+  walk(repoPath, 0);
+  return results;
+}
+
+function indexCsprojByGuid(repoPath: string): Map<string, CsprojInfo> {
+  const index = new Map<string, CsprojInfo>();
+  const projectGuidRe = /<ProjectGuid>\s*\{?([0-9A-Fa-f-]{36})\}?\s*<\/ProjectGuid>/i;
+
+  for (const csprojPath of findCsprojFiles(repoPath)) {
+    let text = '';
+    try { text = fs.readFileSync(csprojPath, 'utf-8'); } catch { continue; }
+    const match = projectGuidRe.exec(text);
+    if (!match) continue;
+    const projectGuid = normalizeGuid(match[1]);
+    index.set(projectGuid, {
+      projectName: path.basename(csprojPath, '.csproj'),
+      projectPath: csprojPath,
+      projectGuid,
+    });
+  }
+
+  return index;
+}
+
+function extractMsb4051Guids(text: string): { ownerGuid: string; missingGuid: string } | null {
+  const msbIndex = text.toUpperCase().indexOf('MSB4051');
+  if (msbIndex < 0) return null;
+
+  const segment = text.slice(msbIndex, msbIndex + 2000);
+  const guids = [...segment.matchAll(/\{([0-9A-Fa-f-]{36})\}/g)].map((m) => normalizeGuid(m[1]));
+  if (guids.length < 2) return null;
+
+  return {
+    ownerGuid: guids[0],
+    missingGuid: guids[1],
+  };
+}
+
+function findNestedParentGuid(slnText: string, childGuid: string): string | null {
+  const eol = slnText.includes('\r\n') ? '\r\n' : '\n';
+  const header = `GlobalSection(NestedProjects) = preSolution`;
+  const start = slnText.indexOf(header);
+  if (start < 0) return null;
+
+  const end = slnText.indexOf(`${eol}\tEndGlobalSection`, start);
+  if (end < 0) return null;
+
+  const section = slnText.slice(start, end);
+  const wanted = normalizeGuid(childGuid);
+
+  for (const match of section.matchAll(/\{([0-9A-Fa-f-]{36})\}\s*=\s*\{([0-9A-Fa-f-]{36})\}/g)) {
+    if (normalizeGuid(match[1]) === wanted) {
+      return normalizeGuid(match[2]);
+    }
+  }
+  return null;
+}
+
+function findCommonFolderGuid(slnText: string): string | null {
+  const re = new RegExp(
+    `Project\\("\\{${SOLUTION_FOLDER_TYPE_GUID}\\}"\\)\\s*=\\s*"Common"\\s*,\\s*"[^"]*"\\s*,\\s*"\\{([0-9A-Fa-f-]{36})\\}"`,
+    'i'
+  );
+  const match = re.exec(slnText);
+  return match ? normalizeGuid(match[1]) : null;
+}
+
+function repairMissingProjectGuidInSln(
+  slnPath: string,
+  ownerGuid: string,
+  missingProject: CsprojInfo
+): { repaired: boolean; reason: string } {
+  let slnText = '';
+  try {
+    slnText = fs.readFileSync(slnPath, 'utf-8');
+  } catch {
+    return { repaired: false, reason: `Cannot read solution file: ${slnPath}` };
+  }
+
+  const eol = slnText.includes('\r\n') ? '\r\n' : '\n';
+  const missingGuid = normalizeGuid(missingProject.projectGuid);
+  const missingGuidLit = toGuidLiteral(missingGuid);
+
+  const existingProjectDecl = new RegExp(
+    `Project\\("\\{[0-9A-Fa-f-]{36}\\}"\\)\\s*=\\s*"[^"]+"\\s*,\\s*"[^"]+"\\s*,\\s*"\\{${missingGuid}\\}"`,
+    'i'
+  );
+  if (existingProjectDecl.test(slnText)) {
+    return { repaired: false, reason: `GUID ${missingGuidLit} is already declared in .sln` };
+  }
+
+  const globalMarker = `${eol}Global${eol}`;
+  const globalPos = slnText.indexOf(globalMarker);
+  if (globalPos < 0) {
+    return { repaired: false, reason: 'Cannot find Global section in .sln' };
+  }
+
+  const slnDir = path.dirname(slnPath);
+  const relProjectPath = path.relative(slnDir, missingProject.projectPath).replace(/\//g, '\\');
+  const projectBlock =
+    `Project("{${CSPROJ_TYPE_GUID}}") = "${missingProject.projectName}", "${relProjectPath}", "${missingGuidLit}"${eol}` +
+    `EndProject${eol}`;
+  slnText =
+    slnText.slice(0, globalPos + eol.length) +
+    projectBlock +
+    slnText.slice(globalPos + eol.length);
+
+  const configHeader = `GlobalSection(ProjectConfigurationPlatforms) = postSolution`;
+  const configStart = slnText.indexOf(configHeader);
+  if (configStart >= 0) {
+    const configEnd = slnText.indexOf(`${eol}\tEndGlobalSection`, configStart);
+    if (configEnd >= 0) {
+      const configSection = slnText.slice(configStart, configEnd);
+      const activeCfgNeedle = `${missingGuidLit}.Debug|Any CPU.ActiveCfg`;
+      if (!configSection.includes(activeCfgNeedle)) {
+        const configLines = [
+          `\t\t${missingGuidLit}.Debug|Any CPU.ActiveCfg = Debug|Any CPU`,
+          `\t\t${missingGuidLit}.Debug|Any CPU.Build.0 = Debug|Any CPU`,
+          `\t\t${missingGuidLit}.Release|Any CPU.ActiveCfg = Release|Any CPU`,
+          `\t\t${missingGuidLit}.Release|Any CPU.Build.0 = Release|Any CPU`,
+        ].join(eol);
+        slnText = slnText.slice(0, configEnd) + eol + configLines + slnText.slice(configEnd);
+      }
+    }
+  }
+
+  const ownerParentGuid = findNestedParentGuid(slnText, ownerGuid);
+  const fallbackParentGuid = findCommonFolderGuid(slnText);
+  const parentGuid = ownerParentGuid ?? fallbackParentGuid;
+  if (parentGuid) {
+    const nestedHeader = `GlobalSection(NestedProjects) = preSolution`;
+    const nestedStart = slnText.indexOf(nestedHeader);
+    if (nestedStart >= 0) {
+      const nestedEnd = slnText.indexOf(`${eol}\tEndGlobalSection`, nestedStart);
+      if (nestedEnd >= 0) {
+        const nestedSection = slnText.slice(nestedStart, nestedEnd);
+        const mappingNeedle = `${missingGuidLit} = {${parentGuid}}`;
+        if (!nestedSection.includes(mappingNeedle)) {
+          const nestedLine = `\t\t${mappingNeedle}`;
+          slnText = slnText.slice(0, nestedEnd) + eol + nestedLine + slnText.slice(nestedEnd);
+        }
+      }
+    }
+  }
+
+  try {
+    fs.writeFileSync(slnPath, slnText, 'utf-8');
+    return { repaired: true, reason: `Inserted ${missingProject.projectName} (${missingGuidLit}) into ${path.basename(slnPath)}` };
+  } catch {
+    return { repaired: false, reason: `Failed to write repaired solution: ${slnPath}` };
+  }
+}
+
 function findAllSlnFiles(repoPath: string): string[] {
   const SKIP_DIRS = new Set(['node_modules', 'BuildSolution', '.git', 'bin', 'obj', 'packages']);
   const results: string[] = [];
@@ -169,6 +357,7 @@ export async function triggerBuild(repo: string, branch: string): Promise<BuildR
 
     const slnFiles = findRelatedSolutions(repoPath, changedFiles, allSlns);
     console.log(`[build] Related solutions (${slnFiles.length}): ${slnFiles.map((s) => path.relative(repoPath, s)).join(', ')}`);
+    let csprojIndex: Map<string, CsprojInfo> | null = null;
 
     if (slnFiles.length === 0) {
       console.log(`[build] No .sln found, running dotnet build in root`);
@@ -183,7 +372,32 @@ export async function triggerBuild(repo: string, branch: string): Promise<BuildR
         const bld = await runCommand('dotnet', ['build', sln, '--nologo'], repoPath);
         allOutput += `\n=== dotnet build ${slnRel} ===\n${bld.stdout}`;
         allError += bld.stderr;
-        if (bld.code !== 0) success = false;
+
+        let solutionSucceeded = bld.code === 0;
+        if (!solutionSucceeded) {
+          const msb4051 = extractMsb4051Guids(`${bld.stdout}\n${bld.stderr}`);
+          if (msb4051) {
+            if (!csprojIndex) {
+              csprojIndex = indexCsprojByGuid(repoPath);
+            }
+            const missingProject = csprojIndex.get(msb4051.missingGuid);
+            if (missingProject) {
+              const repair = repairMissingProjectGuidInSln(sln, msb4051.ownerGuid, missingProject);
+              allOutput += `\n=== auto-repair ${slnRel} ===\n${repair.reason}\n`;
+              if (repair.repaired) {
+                console.log(`[build] auto-repair applied to ${slnRel}; retrying once`);
+                const retry = await runCommand('dotnet', ['build', sln, '--nologo'], repoPath);
+                allOutput += `\n=== dotnet build (retry after auto-repair) ${slnRel} ===\n${retry.stdout}`;
+                allError += retry.stderr;
+                solutionSucceeded = retry.code === 0;
+              }
+            } else {
+              allError += `\n[auto-repair] MSB4051 detected in ${slnRel}, but missing GUID {${msb4051.missingGuid}} was not found in any .csproj ProjectGuid.\n`;
+            }
+          }
+        }
+
+        if (!solutionSucceeded) success = false;
       }
     }
   }

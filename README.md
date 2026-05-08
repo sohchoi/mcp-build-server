@@ -186,6 +186,7 @@ For each webhook request, the server runs:
 4. `git checkout -B <branch> origin/<branch>`
 5. Find all `.sln` files and select related solutions by changed path
 6. `dotnet build <solution>.sln --nologo` for each related solution
+7. If a solution fails with `MSB4051`, auto-repair the missing project GUID in `.sln` and retry that solution once
 
 ### Important repo-name rule
 
@@ -246,5 +247,7 @@ Once the server is running, ask Copilot CLI:
 
 **Admin.sln GUID error (MSB4051)**
 - A project is referenced in the solution but missing from the `.sln` file
-- Open the `.sln` in a text editor, find the missing GUID in `ProjectReferences`, locate the `.csproj` file, and add a `Project(...)` entry
+- The server now tries to auto-fix this by adding the missing project entry and retrying once
+- If auto-repair still fails, check whether the missing GUID exists in any `.csproj` `<ProjectGuid>` under the repo
+- If not found, add/fix the project manually in the solution and push again
 
