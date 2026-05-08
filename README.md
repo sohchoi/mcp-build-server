@@ -11,13 +11,16 @@ Local Mac/Windows  -->  git push  -->  TFS/Git server
                                             v
                                     VDI (Windows)
                                   mcp-build-server
-                                  git fetch + checkout
+                                  git stash (if dirty) + fetch + checkout
                                   dotnet build (related solutions)
                                             |
                                             v
                                GitHub Copilot CLI (MCP tools)
                                build_status / list_build_history
 ```
+
+The push itself is **not blocked** by webhook failure.  
+If VDI is unreachable, the hook prints a warning and push still continues.
 
 ---
 
@@ -70,6 +73,24 @@ node dist/index.js
 ```
 
 To run it persistently (survives logoff), use Task Scheduler or NSSM to run `node dist/index.js` from `D:\mcp-build-server` as a background service.
+
+### 4.1 Server operation commands (Windows VDI)
+
+```powershell
+# start
+cd D:\mcp-build-server
+node dist/index.js
+
+# stop (same terminal)
+Ctrl + C
+
+# stop (background process on 8080)
+$pid = (Get-NetTCPConnection -LocalPort 8080 -State Listen | Select-Object -First 1 -ExpandProperty OwningProcess)
+Stop-Process -Id $pid
+
+# health check
+Invoke-WebRequest -Uri "http://localhost:8080/health" -UseBasicParsing
+```
 
 ### 5. Configure Copilot CLI
 
@@ -156,6 +177,26 @@ For each push:
 2. Compares changed files in your branch vs `master` (or `main`)
 3. Builds solutions related to those changed paths
 
+### Build flow details
+
+For each webhook request, the server runs:
+1. `git status --porcelain`
+2. If dirty: `git stash push -u -m "mcp-auto-stash:<timestamp>:<branch>"`
+3. `git fetch origin <branch>`
+4. `git checkout -B <branch> origin/<branch>`
+5. Find all `.sln` files and select related solutions by changed path
+6. `dotnet build <solution>.sln --nologo` for each related solution
+
+### Important repo-name rule
+
+The hook sends `repo` as your local folder name (basename of `git rev-parse --show-toplevel`).  
+That name must match a VDI folder under `REPOS_BASE_DIR`.
+
+Example:
+- Local: `/Users/sohchoi/source/Qoo10DevJP`
+- VDI: `D:\Qoo10DevJP`
+- Sent repo value: `Qoo10DevJP`
+
 ---
 
 ## MCP Tools (Copilot CLI)
@@ -196,6 +237,12 @@ Once the server is running, ask Copilot CLI:
 **Wrong branch built**
 - The server always does `git fetch origin <branch>` + `git checkout -B <branch> origin/<branch>` before building
 - If the VDI repo has uncommitted changes, the server auto-stashes them first (`git stash push -u`) and then switches to the pushed branch
+
+**I need my previous uncommitted files after auto-stash**
+- On VDI repo:
+  - `git stash list`
+  - `git stash show -p stash@{0}`
+  - `git stash apply stash@{0}` (or `git stash pop stash@{0}`)
 
 **Admin.sln GUID error (MSB4051)**
 - A project is referenced in the solution but missing from the `.sln` file
