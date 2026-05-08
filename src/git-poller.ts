@@ -57,42 +57,49 @@ async function pollRepo(repo: string, state: PollerState): Promise<void> {
 
   const branches = await getTrackedBranches(repoPath);
 
-  // Process branches concurrently (max 5 at a time to avoid overloading TFS)
-  const CONCURRENCY = 5;
-  for (let i = 0; i < branches.length; i += CONCURRENCY) {
-    const chunk = branches.slice(i, i + CONCURRENCY);
-    await Promise.all(chunk.map(async (branch) => {
-      const remoteSha = await getRemoteHeadSha(repoPath, branch);
-      if (!remoteSha) return;
+  // Process branches one at a time to avoid hammering TFS
+  for (const branch of branches) {
+    const remoteSha = await getRemoteHeadSha(repoPath, branch);
+    if (!remoteSha) continue;
 
-      const lastSha = state[repo][branch];
-      if (lastSha !== remoteSha) {
-        if (lastSha) {
-          console.log(`[poller] ${repo}@${branch} changed: ${lastSha.slice(0, 7)} → ${remoteSha.slice(0, 7)}`);
-          triggerBuild(repo, branch).catch((e: unknown) => console.error('[poller] build error:', e));
-        } else {
-          console.log(`[poller] ${repo}@${branch} first seen at ${remoteSha.slice(0, 7)}`);
-        }
-        state[repo][branch] = remoteSha;
+    const lastSha = state[repo][branch];
+    if (lastSha !== remoteSha) {
+      if (lastSha) {
+        console.log(`[poller] ${repo}@${branch} changed: ${lastSha.slice(0, 7)} → ${remoteSha.slice(0, 7)}`);
+        triggerBuild(repo, branch).catch((e: unknown) => console.error('[poller] build error:', e));
+      } else {
+        console.log(`[poller] ${repo}@${branch} first seen at ${remoteSha.slice(0, 7)}`);
       }
-    }));
+      state[repo][branch] = remoteSha;
+    }
   }
 }
+
+let isPolling = false;
 
 export async function startPoller(): Promise<void> {
   console.log(`[poller] Starting — polling every ${POLL_INTERVAL_MS / 1000}s`);
 
   async function poll() {
-    const repos = listRepos();
-    const state = loadState();
-    for (const repo of repos) {
-      try {
-        await pollRepo(repo, state);
-      } catch (e: unknown) {
-        console.error(`[poller] error polling ${repo}:`, e);
-      }
+    if (isPolling) {
+      console.log('[poller] Previous poll still running, skipping this cycle');
+      return;
     }
-    saveState(state);
+    isPolling = true;
+    try {
+      const repos = listRepos();
+      const state = loadState();
+      for (const repo of repos) {
+        try {
+          await pollRepo(repo, state);
+        } catch (e: unknown) {
+          console.error(`[poller] error polling ${repo}:`, e);
+        }
+      }
+      saveState(state);
+    } finally {
+      isPolling = false;
+    }
   }
 
   // Run seeding in background — don't await, so server stays responsive

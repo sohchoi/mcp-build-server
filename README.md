@@ -52,7 +52,7 @@ PORT=8080
 REPOS_BASE_DIR=D:\          # Root folder containing your git repos (e.g. D:\Qoo10DevJP lives here)
 WEBHOOK_SECRET=your-secret  # Any random string — must match what the hook sends
 MAX_BUILDS_PER_REPO=20
-POLL_INTERVAL_MS=30000      # Poll TFS every 30 seconds as fallback
+POLL_INTERVAL_MS=300000     # Fallback poll interval in ms (300000 = 5 min). Only used if the pre-push hook is not installed.
 ```
 
 ### 3. Open Windows Firewall for port 8080
