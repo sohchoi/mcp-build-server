@@ -20,9 +20,9 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
-// /hook-content — returns the raw post-push hook file.
-// Simplest install on Mac: cd into repo, then:
-//   curl -s http://<VDI>:3333/hook-content > .git/hooks/post-push && chmod +x .git/hooks/post-push
+// /hook-content — returns the raw pre-push hook file.
+// Simplest install on Mac:
+//   curl -s http://<VDI>:8080/hook-content > .git/hooks/pre-push && chmod +x .git/hooks/pre-push
 app.get('/hook-content', (req, res) => {
   const host = req.hostname;
   const port = PORT;
@@ -45,26 +45,7 @@ HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$VDI_URL" \\
   res.send(hook);
 });
 
-// /install-hook — shell script installer (for curl | sh usage)
-app.get('/install-hook', (req, res) => {
-  const host = req.hostname;
-  const port = PORT;
-  const secret = WEBHOOK_SECRET || 'change-me';
-  const script = `#!/bin/sh
-REPO_DIR="\$(git rev-parse --show-toplevel 2>/dev/null)"
-if [ -z "\$REPO_DIR" ]; then
-  echo "ERROR: Not inside a git repository."
-  exit 1
-fi
-HOOK="\$REPO_DIR/.git/hooks/post-push"
-curl -s "http://${host}:${port}/hook-content" > "\$HOOK" && chmod +x "\$HOOK"
-echo "Hook installed: \$HOOK"
-`;
-  res.setHeader('Content-Type', 'text/plain');
-  res.send(script);
-});
-
-// Post-push webhook
+// Pre-push webhook
 app.use('/webhook', createWebhookRouter(WEBHOOK_SECRET));
 
 // MCP server (Streamable HTTP transport)

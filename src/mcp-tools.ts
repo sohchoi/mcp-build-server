@@ -1,7 +1,5 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod/v3';
-import fs from 'fs';
-import path from 'path';
 import { triggerBuild, listRepos, resolveRepoPath } from './build-runner.js';
 import {
   getLatestBuild,

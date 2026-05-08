@@ -4,5 +4,5 @@ REM To auto-start on login, add a shortcut to this file in:
 REM   shell:startup  (Win+R → shell:startup)
 
 cd /d D:\mcp-build-server
-echo Starting MCP Build Server on port 3333...
+echo Starting MCP Build Server on port 8080...
 node dist\index.js >> server.log 2>> server-err.log

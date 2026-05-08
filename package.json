@@ -1,7 +1,7 @@
 {
   "name": "mcp-build-server",
   "version": "1.0.0",
-  "description": "MCP server that triggers git pull + dotnet build when a post-push hook fires from a local machine",
+  "description": "MCP server that triggers git fetch/checkout + dotnet build from a pre-push hook",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",

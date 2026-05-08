@@ -7,7 +7,7 @@ An MCP (Model Context Protocol) server that runs on your Windows VDI and automat
 ```
 Local Mac/Windows  -->  git push  -->  TFS/Git server
                                             |
-                              pre-push hook |  or  git poller (every 30s)
+                              pre-push hook
                                             v
                                     VDI (Windows)
                                   mcp-build-server
@@ -198,7 +198,6 @@ Once the server is running, ask Copilot CLI:
 | `GET /health` | Server health check |
 | `POST /webhook` | Receives push notifications from the pre-push hook |
 | `GET /hook-content` | Returns the pre-push hook script (pipe to a file to install) |
-| `GET /install-hook` | Shell script installer (for `curl \| sh`) |
 | `GET /mcp` / `POST /mcp` | MCP protocol endpoint |
 
 ---
@@ -216,9 +215,6 @@ Once the server is running, ask Copilot CLI:
 
 **Wrong branch built**
 - The server always does `git fetch origin <branch>` + `git checkout -B <branch> origin/<branch>` before building
-
-**Only master is built**
-- You are seeing the git poller, which picks up branch changes from TFS. Push again after the server restarts.
 
 **Admin.sln GUID error (MSB4051)**
 - A project is referenced in the solution but missing from the `.sln` file
