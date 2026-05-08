@@ -1,0 +1,26 @@
+#!/bin/sh
+# post-push git hook
+# Copy this file to .git/hooks/post-push in each local repo, then:
+#   chmod +x .git/hooks/post-push
+#
+# Variables to configure:
+VDI_URL="http://<VDI_IP_OR_HOSTNAME>:3333/webhook"
+SECRET="change-me-to-something-random"
+
+REPO=$(basename "$(git rev-parse --show-toplevel)")
+BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "HEAD")
+
+echo "[post-push] Notifying VDI build server: repo=$REPO branch=$BRANCH"
+
+RESULT=$(curl -s -o /dev/null -w "%{http_code}" \
+  -X POST "$VDI_URL" \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Secret: $SECRET" \
+  -d "{\"repo\":\"$REPO\",\"branch\":\"$BRANCH\"}" \
+  --max-time 5)
+
+if [ "$RESULT" = "200" ]; then
+  echo "[post-push] ✅ Build triggered on VDI"
+else
+  echo "[post-push] ⚠️  VDI notification returned HTTP $RESULT (server may be offline)"
+fi
