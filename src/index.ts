@@ -4,7 +4,6 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createWebhookRouter } from './webhook.js';
 import { registerTools } from './mcp-tools.js';
-import { startPoller } from './git-poller.js';
 
 const PORT = parseInt(process.env.PORT ?? '8080', 10);
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET ?? '';
@@ -108,5 +107,4 @@ app.listen(PORT, () => {
   console.log(`  Webhook:    POST http://localhost:${PORT}/webhook`);
   console.log(`  MCP:        http://localhost:${PORT}/mcp`);
   console.log(`  Health:     http://localhost:${PORT}/health`);
-  startPoller().catch((e: unknown) => console.error('[poller] startup error:', e));
 });

@@ -110,24 +110,4 @@ export function registerTools(server: McpServer): void {
       return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
     }
   );
-
-  // ── poll_status ─────────────────────────────────────────────────────────────
-  server.registerTool(
-    'poll_status',
-    { description: 'Show the last known commit SHAs tracked by the git poller for each repo/branch' },
-    async () => {
-      const stateFile = path.join(__dirname, '..', 'data', 'poller-state.json');
-      if (!fs.existsSync(stateFile)) {
-        return { content: [{ type: 'text' as const, text: 'Poller has not run yet — no state file found.' }] };
-      }
-      const state = JSON.parse(fs.readFileSync(stateFile, 'utf-8')) as Record<string, Record<string, string>>;
-      const lines: string[] = ['**Git Poller State** (polls every 2 min):', ''];
-      for (const [repo, branches] of Object.entries(state)) {
-        for (const [branch, sha] of Object.entries(branches)) {
-          lines.push(`• ${repo}@${branch} — ${sha.slice(0, 8)}`);
-        }
-      }
-      return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
-    }
-  );
 }

@@ -52,7 +52,6 @@ PORT=8080
 REPOS_BASE_DIR=D:\          # Root folder containing your git repos (e.g. D:\Qoo10DevJP lives here)
 WEBHOOK_SECRET=your-secret  # Any random string — must match what the hook sends
 MAX_BUILDS_PER_REPO=20
-POLL_INTERVAL_MS=300000     # Fallback poll interval in ms (300000 = 5 min). Only used if the pre-push hook is not installed.
 ```
 
 ### 3. Open Windows Firewall for port 8080
@@ -110,8 +109,6 @@ curl -v --max-time 5 http://<VDI_IP>:8080/health
 # Windows
 Invoke-WebRequest -Uri "http://<VDI_IP>:8080/health" -TimeoutSec 5
 ```
-
-If it times out, the corporate network firewall is blocking direct access. In that case the **git poller** (already running on VDI) detects your push within 30 seconds automatically — no hook needed.
 
 ### Mac local setup
 
@@ -191,7 +188,6 @@ Once the server is running, ask Copilot CLI:
 | `what's the build status of Qoo10DevJP?` | Shows last build result for the repo |
 | `build history for Qoo10DevJP` | Lists recent builds with status |
 | `trigger a build for Qoo10DevJP on my branch` | Manually starts a build |
-| `what's the poller doing?` | Shows git poller status |
 
 ---
 
@@ -227,3 +223,4 @@ Once the server is running, ask Copilot CLI:
 **Admin.sln GUID error (MSB4051)**
 - A project is referenced in the solution but missing from the `.sln` file
 - Open the `.sln` in a text editor, find the missing GUID in `ProjectReferences`, locate the `.csproj` file, and add a `Project(...)` entry
+
