@@ -27,21 +27,6 @@ export function listRepos(): string[] {
     .map((d) => d.name);
 }
 
-interface RepoBuildConfig {
-  solutions?: string[];  // explicit list of sln paths (relative to repo root)
-  excluded?: string[];   // sln paths to always skip (relative to repo root)
-}
-
-function readRepoBuildConfig(repoPath: string): RepoBuildConfig {
-  const cfgPath = path.join(repoPath, '.mcp-build.json');
-  if (!fs.existsSync(cfgPath)) return {};
-  try {
-    return JSON.parse(fs.readFileSync(cfgPath, 'utf-8')) as RepoBuildConfig;
-  } catch {
-    return {};
-  }
-}
-
 function findAllSlnFiles(repoPath: string): string[] {
   const SKIP_DIRS = new Set(['node_modules', 'BuildSolution', '.git', 'bin', 'obj', 'packages']);
   const results: string[] = [];
@@ -159,28 +144,14 @@ export async function triggerBuild(repo: string, branch: string): Promise<BuildR
     allError += `\ngit checkout failed with exit code ${checkout.code}`;
   }
 
-  // Step 2: dotnet build relevant solutions
+  // Step 2: dotnet build related solutions
   if (success) {
-    const cfg = readRepoBuildConfig(repoPath);
+    const allSlns = findAllSlnFiles(repoPath);
+    const changedFiles = await getChangedFiles(repoPath);
+    console.log(`[build] Changed files (${changedFiles.length}): ${changedFiles.slice(0, 5).join(', ')}${changedFiles.length > 5 ? '...' : ''}`);
 
-    let slnFiles: string[];
-    if (cfg.solutions && cfg.solutions.length > 0) {
-      slnFiles = cfg.solutions.map((s) => path.join(repoPath, s));
-      console.log(`[build] Using explicit solutions from .mcp-build.json: ${slnFiles.length}`);
-    } else {
-      const excludedSet = new Set(
-        (cfg.excluded ?? []).map((e) => path.join(repoPath, e).toLowerCase())
-      );
-      const allSlns = findAllSlnFiles(repoPath).filter(
-        (s) => !excludedSet.has(s.toLowerCase())
-      );
-
-      const changedFiles = await getChangedFiles(repoPath);
-      console.log(`[build] Changed files (${changedFiles.length}): ${changedFiles.slice(0, 5).join(', ')}${changedFiles.length > 5 ? '...' : ''}`);
-
-      slnFiles = findRelatedSolutions(repoPath, changedFiles, allSlns);
-      console.log(`[build] Related solutions (${slnFiles.length}): ${slnFiles.map((s) => path.relative(repoPath, s)).join(', ')}`);
-    }
+    const slnFiles = findRelatedSolutions(repoPath, changedFiles, allSlns);
+    console.log(`[build] Related solutions (${slnFiles.length}): ${slnFiles.map((s) => path.relative(repoPath, s)).join(', ')}`);
 
     if (slnFiles.length === 0) {
       console.log(`[build] No .sln found, running dotnet build in root`);

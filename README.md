@@ -147,34 +147,14 @@ Invoke-WebRequest -Uri "http://<VDI_IP>:8080/hook-content" -OutFile ".git\hooks\
 
 ---
 
-## Per-repo build configuration
+## Build selection
 
-By default the server auto-detects which `.sln` files are related to your changed files and builds only those.
+The server has no per-repo config or repo-specific restrictions.
 
-To customize, create `.mcp-build.json` in your repo root:
-
-```json
-{
-  "solutions": [
-    "Backend\\MyProject\\MyProject.sln"
-  ]
-}
-```
-
-Or to exclude specific broken solutions:
-
-```json
-{
-  "excluded": [
-    "Backend\\BrokenProject\\BrokenProject.sln"
-  ]
-}
-```
-
-If neither field is set, the server:
-1. Finds all `.sln` files in the repo
-2. Compares them against files changed in your branch vs `master`
-3. Builds only the solutions that contain changed files
+For each push:
+1. Finds all `.sln` files in the pushed repo
+2. Compares changed files in your branch vs `master` (or `main`)
+3. Builds solutions related to those changed paths
 
 ---
 
