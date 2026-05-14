@@ -20,6 +20,13 @@ function dataFilePath(): string {
   return path.join(__dirname, '..', 'data', 'builds.json');
 }
 
+function ensureDataDir(): void {
+  const dataDir = path.dirname(dataFilePath());
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+}
+
 function loadData(): BuildData {
   const fp = dataFilePath();
   if (!fs.existsSync(fp)) {
@@ -33,6 +40,7 @@ function loadData(): BuildData {
 }
 
 function saveData(data: BuildData): void {
+  ensureDataDir();
   fs.writeFileSync(dataFilePath(), JSON.stringify(data, null, 2), 'utf-8');
 }
 
