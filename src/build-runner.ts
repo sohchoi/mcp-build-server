@@ -215,6 +215,77 @@ function repairMissingProjectGuidInSln(
   }
 }
 
+function removeDanglingProjectDependencyInSln(
+  slnPath: string,
+  ownerGuid: string,
+  missingGuid: string
+): { repaired: boolean; reason: string } {
+  let slnText = '';
+  try {
+    slnText = fs.readFileSync(slnPath, 'utf-8');
+  } catch {
+    return { repaired: false, reason: `Cannot read solution file: ${slnPath}` };
+  }
+
+  const eol = slnText.includes('\r\n') ? '\r\n' : '\n';
+  const lines = slnText.split(eol);
+  const ownerGuidLit = toGuidLiteral(ownerGuid);
+  const missingGuidLit = toGuidLiteral(missingGuid);
+
+  let inOwnerProject = false;
+  let inDependencies = false;
+  let removed = false;
+  const nextLines: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('Project(')) {
+      inOwnerProject = line.includes(`"${ownerGuidLit}"`);
+      inDependencies = false;
+    }
+
+    if (inOwnerProject && trimmed.startsWith('ProjectSection(ProjectDependencies)')) {
+      inDependencies = true;
+      nextLines.push(line);
+      continue;
+    }
+
+    if (inDependencies && trimmed.startsWith('EndProjectSection')) {
+      inDependencies = false;
+      nextLines.push(line);
+      continue;
+    }
+
+    if (inDependencies && line.includes(missingGuidLit)) {
+      removed = true;
+      continue;
+    }
+
+    nextLines.push(line);
+    if (inOwnerProject && trimmed === 'EndProject') {
+      inOwnerProject = false;
+      inDependencies = false;
+    }
+  }
+
+  if (!removed) {
+    return {
+      repaired: false,
+      reason: `Missing GUID ${missingGuidLit} was not found in ProjectDependencies of owner ${ownerGuidLit}`,
+    };
+  }
+
+  try {
+    fs.writeFileSync(slnPath, nextLines.join(eol), 'utf-8');
+    return {
+      repaired: true,
+      reason: `Removed dangling ProjectDependencies entry ${missingGuidLit} from owner ${ownerGuidLit} in ${path.basename(slnPath)}`,
+    };
+  } catch {
+    return { repaired: false, reason: `Failed to write repaired solution: ${slnPath}` };
+  }
+}
+
 function findAllSlnFiles(repoPath: string): string[] {
   const SKIP_DIRS = new Set(['node_modules', 'BuildSolution', '.git', 'bin', 'obj', 'packages']);
   const results: string[] = [];
@@ -468,6 +539,8 @@ export async function triggerBuild(repo: string, branch: string): Promise<BuildR
         const bld = await runCommand('dotnet', ['build', sln, '--nologo'], repoPath);
         allOutput += `\n=== dotnet build ${slnRel} ===\n${bld.stdout}`;
         allError += bld.stderr;
+        let lastBuildStdout = bld.stdout;
+        let lastBuildStderr = bld.stderr;
 
         let solutionSucceeded = bld.code === 0;
         if (!solutionSucceeded) {
@@ -485,15 +558,29 @@ export async function triggerBuild(repo: string, branch: string): Promise<BuildR
                 const retry = await runCommand('dotnet', ['build', sln, '--nologo'], repoPath);
                 allOutput += `\n=== dotnet build (retry after auto-repair) ${slnRel} ===\n${retry.stdout}`;
                 allError += retry.stderr;
+                lastBuildStdout = retry.stdout;
+                lastBuildStderr = retry.stderr;
                 solutionSucceeded = retry.code === 0;
               }
             } else {
-              allError += `\n[auto-repair] MSB4051 detected in ${slnRel}, but missing GUID {${msb4051.missingGuid}} was not found in any .csproj ProjectGuid.\n`;
+              const cleanup = removeDanglingProjectDependencyInSln(sln, msb4051.ownerGuid, msb4051.missingGuid);
+              allOutput += `\n=== auto-repair ${slnRel} ===\n${cleanup.reason}\n`;
+              if (cleanup.repaired) {
+                console.log(`[build] removed dangling dependency in ${slnRel}; retrying once`);
+                const retry = await runCommand('dotnet', ['build', sln, '--nologo'], repoPath);
+                allOutput += `\n=== dotnet build (retry after dependency cleanup) ${slnRel} ===\n${retry.stdout}`;
+                allError += retry.stderr;
+                lastBuildStdout = retry.stdout;
+                lastBuildStderr = retry.stderr;
+                solutionSucceeded = retry.code === 0;
+              } else {
+                allError += `\n[auto-repair] MSB4051 detected in ${slnRel}, but missing GUID {${msb4051.missingGuid}} was not found in any .csproj ProjectGuid and dependency cleanup did not apply.\n`;
+              }
             }
           }
         }
 
-        if (!solutionSucceeded && isWebApplicationTargetsMissing(`${bld.stdout}\n${bld.stderr}`)) {
+        if (!solutionSucceeded && isWebApplicationTargetsMissing(`${lastBuildStdout}\n${lastBuildStderr}`)) {
           if (!vsToolsPathForRetry) {
             vsToolsPathForRetry = findVSToolsPathForWebTargets();
           }

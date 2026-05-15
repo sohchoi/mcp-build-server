@@ -248,6 +248,7 @@ Once the server is running, ask Copilot CLI:
 **Admin.sln GUID error (MSB4051)**
 - A project is referenced in the solution but missing from the `.sln` file
 - The server now tries to auto-fix this by adding the missing project entry and retrying once
+- If the GUID does not exist in any `.csproj`, the server removes dangling `ProjectDependencies` entry for that missing GUID and retries once
 - If auto-repair still fails, check whether the missing GUID exists in any `.csproj` `<ProjectGuid>` under the repo
 - If not found, add/fix the project manually in the solution and push again
 
