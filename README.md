@@ -251,3 +251,8 @@ Once the server is running, ask Copilot CLI:
 - If auto-repair still fails, check whether the missing GUID exists in any `.csproj` `<ProjectGuid>` under the repo
 - If not found, add/fix the project manually in the solution and push again
 
+**MSB4019 missing `Microsoft.WebApplication.targets`**
+- This means the machine is missing a usable Visual Studio WebApplication targets path for the project type
+- The server now auto-retries with a detected `VSToolsPath` when this error appears
+- If your environment is custom, set `VSTOOLS_PATH` in `.env` explicitly (example: `C:\Program Files (x86)\MSBuild\Microsoft\VisualStudio\v17.0`)
+

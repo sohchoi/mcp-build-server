@@ -276,6 +276,98 @@ function findRelatedSolutions(repoPath: string, changedFiles: string[], allSlns:
   return related.length > 0 ? related : allSlns;
 }
 
+function isWebApplicationTargetsMissing(text: string): boolean {
+  const upper = text.toUpperCase();
+  return upper.includes('MSB4019') && upper.includes('MICROSOFT.WEBAPPLICATION.TARGETS');
+}
+
+function inferVisualStudioVersionFromVSToolsPath(vsToolsPath: string): string {
+  const match = /\\v(\d+\.\d+)(\\|$)/i.exec(vsToolsPath);
+  return match?.[1] ?? '17.0';
+}
+
+function addCandidateIfExists(candidates: string[], candidate: string): void {
+  const target = path.join(candidate, 'WebApplications', 'Microsoft.WebApplication.targets');
+  if (fs.existsSync(target)) {
+    candidates.push(candidate);
+  }
+}
+
+function findVSToolsPathForWebTargets(): string | null {
+  const candidates: string[] = [];
+  const envOverride = process.env.VSTOOLS_PATH;
+  if (envOverride) {
+    addCandidateIfExists(candidates, envOverride);
+  }
+
+  const programFiles = process.env.ProgramFiles ?? 'C:\\Program Files';
+  const programFilesX86 = process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)';
+
+  for (const yearSku of [
+    ['2022', 'BuildTools'],
+    ['2022', 'Enterprise'],
+    ['2022', 'Professional'],
+    ['2022', 'Community'],
+    ['2019', 'BuildTools'],
+    ['2019', 'Enterprise'],
+    ['2019', 'Professional'],
+    ['2019', 'Community'],
+  ] as const) {
+    const [year, sku] = yearSku;
+    addCandidateIfExists(
+      candidates,
+      path.join(programFiles, 'Microsoft Visual Studio', year, sku, 'MSBuild', 'Microsoft', 'VisualStudio', 'v17.0')
+    );
+    addCandidateIfExists(
+      candidates,
+      path.join(programFilesX86, 'Microsoft Visual Studio', year, sku, 'MSBuild', 'Microsoft', 'VisualStudio', 'v17.0')
+    );
+    addCandidateIfExists(
+      candidates,
+      path.join(programFiles, 'Microsoft Visual Studio', year, sku, 'MSBuild', 'Microsoft', 'VisualStudio', 'v16.0')
+    );
+    addCandidateIfExists(
+      candidates,
+      path.join(programFilesX86, 'Microsoft Visual Studio', year, sku, 'MSBuild', 'Microsoft', 'VisualStudio', 'v16.0')
+    );
+  }
+
+  addCandidateIfExists(candidates, path.join(programFilesX86, 'MSBuild', 'Microsoft', 'VisualStudio', 'v17.0'));
+  addCandidateIfExists(candidates, path.join(programFilesX86, 'MSBuild', 'Microsoft', 'VisualStudio', 'v16.0'));
+  addCandidateIfExists(candidates, path.join(programFiles, 'MSBuild', 'Microsoft', 'VisualStudio', 'v17.0'));
+  addCandidateIfExists(candidates, path.join(programFiles, 'MSBuild', 'Microsoft', 'VisualStudio', 'v16.0'));
+
+  const dotnetSdkDir = path.join(programFiles, 'dotnet', 'sdk');
+  if (fs.existsSync(dotnetSdkDir)) {
+    let sdkVersions: string[] = [];
+    try {
+      sdkVersions = fs.readdirSync(dotnetSdkDir, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => d.name)
+        .sort()
+        .reverse();
+    } catch {
+      sdkVersions = [];
+    }
+    for (const ver of sdkVersions) {
+      const base = path.join(dotnetSdkDir, ver, 'Microsoft', 'VisualStudio');
+      addCandidateIfExists(candidates, path.join(base, 'v18.0'));
+      addCandidateIfExists(candidates, path.join(base, 'v17.0'));
+      addCandidateIfExists(candidates, path.join(base, 'v16.0'));
+    }
+  }
+
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const normalized = candidate.toLowerCase();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    return candidate;
+  }
+
+  return null;
+}
+
 async function runCommand(
   cmd: string,
   args: string[],
@@ -316,6 +408,7 @@ export async function triggerBuild(repo: string, branch: string): Promise<BuildR
   let allOutput = '';
   let allError = '';
   let success = true;
+  let stashCreated = false;
 
   // Step 1: auto-stash local changes if worktree is dirty
   const currentBranchResult = await runCommand('git', ['rev-parse', '--abbrev-ref', 'HEAD'], repoPath);
@@ -331,6 +424,8 @@ export async function triggerBuild(repo: string, branch: string): Promise<BuildR
     if (stash.code !== 0) {
       success = false;
       allError += `\ngit stash failed with exit code ${stash.code}`;
+    } else {
+      stashCreated = true;
     }
   }
 
@@ -349,7 +444,7 @@ export async function triggerBuild(repo: string, branch: string): Promise<BuildR
     allError += `\ngit checkout failed with exit code ${checkout.code}`;
   }
 
-  // Step 3: dotnet build related solutions
+  // Step 3: dotnet build related solutions (only after checkout succeeds)
   if (success) {
     const allSlns = findAllSlnFiles(repoPath);
     const changedFiles = await getChangedFiles(repoPath);
@@ -358,6 +453,7 @@ export async function triggerBuild(repo: string, branch: string): Promise<BuildR
     const slnFiles = findRelatedSolutions(repoPath, changedFiles, allSlns);
     console.log(`[build] Related solutions (${slnFiles.length}): ${slnFiles.map((s) => path.relative(repoPath, s)).join(', ')}`);
     let csprojIndex: Map<string, CsprojInfo> | null = null;
+    let vsToolsPathForRetry: string | null = null;
 
     if (slnFiles.length === 0) {
       console.log(`[build] No .sln found, running dotnet build in root`);
@@ -397,9 +493,40 @@ export async function triggerBuild(repo: string, branch: string): Promise<BuildR
           }
         }
 
+        if (!solutionSucceeded && isWebApplicationTargetsMissing(`${bld.stdout}\n${bld.stderr}`)) {
+          if (!vsToolsPathForRetry) {
+            vsToolsPathForRetry = findVSToolsPathForWebTargets();
+          }
+          if (vsToolsPathForRetry) {
+            const vsVersion = inferVisualStudioVersionFromVSToolsPath(vsToolsPathForRetry);
+            allOutput += `\n=== web-targets fallback ${slnRel} ===\nUsing VSToolsPath=${vsToolsPathForRetry} (VisualStudioVersion=${vsVersion})\n`;
+            console.log(`[build] MSB4019 fallback for ${slnRel} using ${vsToolsPathForRetry}`);
+            const retryWithVSTools = await runCommand(
+              'dotnet',
+              [
+                'build',
+                sln,
+                '--nologo',
+                `/p:VSToolsPath=${vsToolsPathForRetry}`,
+                `/p:VisualStudioVersion=${vsVersion}`,
+              ],
+              repoPath
+            );
+            allOutput += `\n=== dotnet build (retry with VSToolsPath) ${slnRel} ===\n${retryWithVSTools.stdout}`;
+            allError += retryWithVSTools.stderr;
+            solutionSucceeded = retryWithVSTools.code === 0;
+          } else {
+            allError += `\n[web-targets] MSB4019 detected in ${slnRel}, but no usable VSToolsPath with WebApplications\\Microsoft.WebApplication.targets was found.\n`;
+          }
+        }
+
         if (!solutionSucceeded) success = false;
       }
     }
+  }
+
+  if (stashCreated && currentBranch !== 'unknown') {
+    allOutput += `\n[stash] Auto-stashed changes from branch "${currentBranch}". They remain in stash until manually restored.`;
   }
 
   const finished: BuildRecord = {
