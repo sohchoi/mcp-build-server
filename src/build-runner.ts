@@ -3,6 +3,7 @@ import { promisify } from 'util';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { upsertBuild, type BuildRecord } from './build-store.js';
 
 const execAsync = promisify(exec);
@@ -347,6 +348,11 @@ function findRelatedSolutions(repoPath: string, changedFiles: string[], allSlns:
   return related.length > 0 ? related : allSlns;
 }
 
+function buildScope(): 'all' | 'related' {
+  const scope = (process.env.BUILD_SCOPE ?? 'all').toLowerCase();
+  return scope === 'related' ? 'related' : 'all';
+}
+
 function isWebApplicationTargetsMissing(text: string): boolean {
   const upper = text.toUpperCase();
   return upper.includes('MSB4019') && upper.includes('MICROSOFT.WEBAPPLICATION.TARGETS');
@@ -454,6 +460,12 @@ async function runCommand(
   });
 }
 
+function createTempWorktreePath(repo: string): string {
+  const base = path.join(os.tmpdir(), 'mcp-build-worktrees');
+  const suffix = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+  return path.join(base, `${repo}-${suffix}`);
+}
+
 export async function triggerBuild(repo: string, branch: string): Promise<BuildRecord> {
   const repoPath = resolveRepoPath(repo);
   const id = crypto.randomUUID();
@@ -479,141 +491,164 @@ export async function triggerBuild(repo: string, branch: string): Promise<BuildR
   let allOutput = '';
   let allError = '';
   let success = true;
-  let stashCreated = false;
+  let tempWorktreePath: string | null = null;
 
-  // Step 1: auto-stash local changes if worktree is dirty
-  const currentBranchResult = await runCommand('git', ['rev-parse', '--abbrev-ref', 'HEAD'], repoPath);
-  const currentBranch = currentBranchResult.code === 0 ? currentBranchResult.stdout.trim() : 'unknown';
-
-  const status = await runCommand('git', ['status', '--porcelain'], repoPath);
-  if (status.code === 0 && status.stdout.trim()) {
-    const stashMessage = `mcp-auto-stash:${new Date().toISOString()}:${currentBranch}`;
-    console.log(`[build] dirty worktree detected on ${currentBranch}, stashing changes`);
-    const stash = await runCommand('git', ['stash', 'push', '-u', '-m', stashMessage], repoPath);
-    allOutput += `=== git stash (auto) ===\n${stash.stdout}`;
-    allError += stash.stderr;
-    if (stash.code !== 0) {
+  try {
+    // Step 1: create temporary worktree for branch build
+    console.log(`[build] git fetch origin ${branch} in ${repoPath}`);
+    const fetch = await runCommand('git', ['fetch', 'origin', branch], repoPath);
+    allOutput += `=== git fetch ===\n${fetch.stdout}`;
+    allError += fetch.stderr;
+    if (fetch.code !== 0) {
       success = false;
-      allError += `\ngit stash failed with exit code ${stash.code}`;
-    } else {
-      stashCreated = true;
+      allError += `\ngit fetch failed with exit code ${fetch.code}`;
     }
-  }
 
-  // Step 2: fetch + checkout the target branch
-  console.log(`[build] git fetch origin ${branch} in ${repoPath}`);
-  const fetch = await runCommand('git', ['fetch', 'origin', branch], repoPath);
-  allOutput += `=== git fetch ===\n${fetch.stdout}`;
-  allError += fetch.stderr;
-
-  console.log(`[build] git checkout -B ${branch} origin/${branch}`);
-  const checkout = await runCommand('git', ['checkout', '-B', branch, `origin/${branch}`], repoPath);
-  allOutput += `\n=== git checkout ${branch} ===\n${checkout.stdout}`;
-  allError += checkout.stderr;
-  if (checkout.code !== 0) {
-    success = false;
-    allError += `\ngit checkout failed with exit code ${checkout.code}`;
-  }
-
-  // Step 3: dotnet build related solutions (only after checkout succeeds)
-  if (success) {
-    const allSlns = findAllSlnFiles(repoPath);
-    const changedFiles = await getChangedFiles(repoPath);
-    console.log(`[build] Changed files (${changedFiles.length}): ${changedFiles.slice(0, 5).join(', ')}${changedFiles.length > 5 ? '...' : ''}`);
-
-    const slnFiles = findRelatedSolutions(repoPath, changedFiles, allSlns);
-    console.log(`[build] Related solutions (${slnFiles.length}): ${slnFiles.map((s) => path.relative(repoPath, s)).join(', ')}`);
-    let csprojIndex: Map<string, CsprojInfo> | null = null;
-    let vsToolsPathForRetry: string | null = null;
-
-    if (slnFiles.length === 0) {
-      console.log(`[build] No .sln found, running dotnet build in root`);
-      const bld = await runCommand('dotnet', ['build', '--nologo'], repoPath);
-      allOutput += `\n=== dotnet build ===\n${bld.stdout}`;
-      allError += bld.stderr;
-      if (bld.code !== 0) success = false;
-    } else {
-      for (const sln of slnFiles) {
-        const slnRel = path.relative(repoPath, sln);
-        console.log(`[build] dotnet build ${slnRel}`);
-        const bld = await runCommand('dotnet', ['build', sln, '--nologo'], repoPath);
-        allOutput += `\n=== dotnet build ${slnRel} ===\n${bld.stdout}`;
-        allError += bld.stderr;
-        let lastBuildStdout = bld.stdout;
-        let lastBuildStderr = bld.stderr;
-
-        let solutionSucceeded = bld.code === 0;
-        if (!solutionSucceeded) {
-          const msb4051 = extractMsb4051Guids(`${bld.stdout}\n${bld.stderr}`);
-          if (msb4051) {
-            if (!csprojIndex) {
-              csprojIndex = indexCsprojByGuid(repoPath);
-            }
-            const missingProject = csprojIndex.get(msb4051.missingGuid);
-            if (missingProject) {
-              const repair = repairMissingProjectGuidInSln(sln, msb4051.ownerGuid, missingProject);
-              allOutput += `\n=== auto-repair ${slnRel} ===\n${repair.reason}\n`;
-              if (repair.repaired) {
-                console.log(`[build] auto-repair applied to ${slnRel}; retrying once`);
-                const retry = await runCommand('dotnet', ['build', sln, '--nologo'], repoPath);
-                allOutput += `\n=== dotnet build (retry after auto-repair) ${slnRel} ===\n${retry.stdout}`;
-                allError += retry.stderr;
-                lastBuildStdout = retry.stdout;
-                lastBuildStderr = retry.stderr;
-                solutionSucceeded = retry.code === 0;
-              }
-            } else {
-              const cleanup = removeDanglingProjectDependencyInSln(sln, msb4051.ownerGuid, msb4051.missingGuid);
-              allOutput += `\n=== auto-repair ${slnRel} ===\n${cleanup.reason}\n`;
-              if (cleanup.repaired) {
-                console.log(`[build] removed dangling dependency in ${slnRel}; retrying once`);
-                const retry = await runCommand('dotnet', ['build', sln, '--nologo'], repoPath);
-                allOutput += `\n=== dotnet build (retry after dependency cleanup) ${slnRel} ===\n${retry.stdout}`;
-                allError += retry.stderr;
-                lastBuildStdout = retry.stdout;
-                lastBuildStderr = retry.stderr;
-                solutionSucceeded = retry.code === 0;
-              } else {
-                allError += `\n[auto-repair] MSB4051 detected in ${slnRel}, but missing GUID {${msb4051.missingGuid}} was not found in any .csproj ProjectGuid and dependency cleanup did not apply.\n`;
-              }
-            }
-          }
+    if (success) {
+      tempWorktreePath = createTempWorktreePath(repo);
+      fs.mkdirSync(path.dirname(tempWorktreePath), { recursive: true });
+      console.log(`[build] git worktree add --detach ${tempWorktreePath} origin/${branch}`);
+      const addWorktree = await runCommand('git', ['worktree', 'add', '--detach', tempWorktreePath, `origin/${branch}`], repoPath);
+      allOutput += `\n=== git worktree add ${branch} ===\n${addWorktree.stdout}`;
+      allError += addWorktree.stderr;
+      if (addWorktree.code !== 0) {
+        success = false;
+        allError += `\ngit worktree add failed with exit code ${addWorktree.code}`;
+      } else {
+        const checkout = await runCommand('git', ['checkout', '-B', branch, `origin/${branch}`], tempWorktreePath);
+        allOutput += `\n=== git checkout ${branch} (temp worktree) ===\n${checkout.stdout}`;
+        allError += checkout.stderr;
+        if (checkout.code !== 0) {
+          success = false;
+          allError += `\ngit checkout in temp worktree failed with exit code ${checkout.code}`;
         }
-
-        if (!solutionSucceeded && isWebApplicationTargetsMissing(`${lastBuildStdout}\n${lastBuildStderr}`)) {
-          if (!vsToolsPathForRetry) {
-            vsToolsPathForRetry = findVSToolsPathForWebTargets();
-          }
-          if (vsToolsPathForRetry) {
-            const vsVersion = inferVisualStudioVersionFromVSToolsPath(vsToolsPathForRetry);
-            allOutput += `\n=== web-targets fallback ${slnRel} ===\nUsing VSToolsPath=${vsToolsPathForRetry} (VisualStudioVersion=${vsVersion})\n`;
-            console.log(`[build] MSB4019 fallback for ${slnRel} using ${vsToolsPathForRetry}`);
-            const retryWithVSTools = await runCommand(
-              'dotnet',
-              [
-                'build',
-                sln,
-                '--nologo',
-                `/p:VSToolsPath=${vsToolsPathForRetry}`,
-                `/p:VisualStudioVersion=${vsVersion}`,
-              ],
-              repoPath
-            );
-            allOutput += `\n=== dotnet build (retry with VSToolsPath) ${slnRel} ===\n${retryWithVSTools.stdout}`;
-            allError += retryWithVSTools.stderr;
-            solutionSucceeded = retryWithVSTools.code === 0;
-          } else {
-            allError += `\n[web-targets] MSB4019 detected in ${slnRel}, but no usable VSToolsPath with WebApplications\\Microsoft.WebApplication.targets was found.\n`;
-          }
-        }
-
-        if (!solutionSucceeded) success = false;
       }
     }
-  }
 
-  if (stashCreated && currentBranch !== 'unknown') {
-    allOutput += `\n[stash] Auto-stashed changes from branch "${currentBranch}". They remain in stash until manually restored.`;
+    // Step 2: dotnet build in temporary worktree only
+    if (success && tempWorktreePath) {
+      const buildRepoPath = tempWorktreePath;
+      const allSlns = findAllSlnFiles(buildRepoPath);
+      const scope = buildScope();
+      let slnFiles = allSlns;
+      if (scope === 'related') {
+        const changedFiles = await getChangedFiles(buildRepoPath);
+        console.log(`[build] Changed files (${changedFiles.length}): ${changedFiles.slice(0, 5).join(', ')}${changedFiles.length > 5 ? '...' : ''}`);
+        slnFiles = findRelatedSolutions(buildRepoPath, changedFiles, allSlns);
+        console.log(`[build] Related solutions (${slnFiles.length}): ${slnFiles.map((s) => path.relative(buildRepoPath, s)).join(', ')}`);
+      } else {
+        console.log(`[build] Build scope=all; solutions (${slnFiles.length}): ${slnFiles.map((s) => path.relative(buildRepoPath, s)).join(', ')}`);
+      }
+
+      let csprojIndex: Map<string, CsprojInfo> | null = null;
+      let vsToolsPathForRetry: string | null = null;
+
+      if (slnFiles.length === 0) {
+        console.log('[build] No .sln found, running dotnet build in root (temp worktree)');
+        const bld = await runCommand('dotnet', ['build', '--nologo'], buildRepoPath);
+        allOutput += `\n=== dotnet build ===\n${bld.stdout}`;
+        allError += bld.stderr;
+        if (bld.code !== 0) success = false;
+      } else {
+        for (const sln of slnFiles) {
+          const slnRel = path.relative(tempWorktreePath, sln);
+          console.log(`[build] dotnet build ${slnRel}`);
+          const bld = await runCommand('dotnet', ['build', sln, '--nologo'], buildRepoPath);
+          allOutput += `\n=== dotnet build ${slnRel} ===\n${bld.stdout}`;
+          allError += bld.stderr;
+          let lastBuildStdout = bld.stdout;
+          let lastBuildStderr = bld.stderr;
+
+          let solutionSucceeded = bld.code === 0;
+          if (!solutionSucceeded) {
+            const msb4051 = extractMsb4051Guids(`${bld.stdout}\n${bld.stderr}`);
+            if (msb4051) {
+              if (!csprojIndex) {
+                csprojIndex = indexCsprojByGuid(buildRepoPath);
+              }
+              const missingProject = csprojIndex.get(msb4051.missingGuid);
+              if (missingProject) {
+                const repair = repairMissingProjectGuidInSln(sln, msb4051.ownerGuid, missingProject);
+                allOutput += `\n=== auto-repair ${slnRel} ===\n${repair.reason}\n`;
+                if (repair.repaired) {
+                  console.log(`[build] auto-repair applied to ${slnRel}; retrying once`);
+                  const retry = await runCommand('dotnet', ['build', sln, '--nologo'], buildRepoPath);
+                  allOutput += `\n=== dotnet build (retry after auto-repair) ${slnRel} ===\n${retry.stdout}`;
+                  allError += retry.stderr;
+                  lastBuildStdout = retry.stdout;
+                  lastBuildStderr = retry.stderr;
+                  solutionSucceeded = retry.code === 0;
+                }
+              } else {
+                const cleanup = removeDanglingProjectDependencyInSln(sln, msb4051.ownerGuid, msb4051.missingGuid);
+                allOutput += `\n=== auto-repair ${slnRel} ===\n${cleanup.reason}\n`;
+                if (cleanup.repaired) {
+                  console.log(`[build] removed dangling dependency in ${slnRel}; retrying once`);
+                  const retry = await runCommand('dotnet', ['build', sln, '--nologo'], buildRepoPath);
+                  allOutput += `\n=== dotnet build (retry after dependency cleanup) ${slnRel} ===\n${retry.stdout}`;
+                  allError += retry.stderr;
+                  lastBuildStdout = retry.stdout;
+                  lastBuildStderr = retry.stderr;
+                  solutionSucceeded = retry.code === 0;
+                } else {
+                  allError += `\n[auto-repair] MSB4051 detected in ${slnRel}, but missing GUID {${msb4051.missingGuid}} was not found in any .csproj ProjectGuid and dependency cleanup did not apply.\n`;
+                }
+              }
+            }
+          }
+
+          if (!solutionSucceeded && isWebApplicationTargetsMissing(`${lastBuildStdout}\n${lastBuildStderr}`)) {
+            if (!vsToolsPathForRetry) {
+              vsToolsPathForRetry = findVSToolsPathForWebTargets();
+            }
+            if (vsToolsPathForRetry) {
+              const vsVersion = inferVisualStudioVersionFromVSToolsPath(vsToolsPathForRetry);
+              allOutput += `\n=== web-targets fallback ${slnRel} ===\nUsing VSToolsPath=${vsToolsPathForRetry} (VisualStudioVersion=${vsVersion})\n`;
+              console.log(`[build] MSB4019 fallback for ${slnRel} using ${vsToolsPathForRetry}`);
+              const retryWithVSTools = await runCommand(
+                'dotnet',
+                [
+                  'build',
+                  sln,
+                  '--nologo',
+                  `/p:VSToolsPath=${vsToolsPathForRetry}`,
+                  `/p:VisualStudioVersion=${vsVersion}`,
+                ],
+                buildRepoPath
+              );
+              allOutput += `\n=== dotnet build (retry with VSToolsPath) ${slnRel} ===\n${retryWithVSTools.stdout}`;
+              allError += retryWithVSTools.stderr;
+              solutionSucceeded = retryWithVSTools.code === 0;
+            } else {
+              allError += `\n[web-targets] MSB4019 detected in ${slnRel}, but no usable VSToolsPath with WebApplications\\Microsoft.WebApplication.targets was found.\n`;
+            }
+          }
+
+          if (!solutionSucceeded) success = false;
+        }
+      }
+    }
+  } finally {
+    if (tempWorktreePath) {
+      const removeWorktree = await runCommand('git', ['worktree', 'remove', '--force', tempWorktreePath], repoPath);
+      allOutput += `\n=== git worktree remove ===\n${removeWorktree.stdout}`;
+      allError += removeWorktree.stderr;
+      if (removeWorktree.code !== 0) {
+        success = false;
+        allError += `\ngit worktree remove failed with exit code ${removeWorktree.code}`;
+      }
+
+      const prune = await runCommand('git', ['worktree', 'prune'], repoPath);
+      allOutput += `\n=== git worktree prune ===\n${prune.stdout}`;
+      allError += prune.stderr;
+
+      try {
+        fs.rmSync(tempWorktreePath, { recursive: true, force: true });
+      } catch (e) {
+        success = false;
+        allError += `\nfailed to remove temp worktree directory: ${(e as Error).message}`;
+      }
+    }
   }
 
   const finished: BuildRecord = {

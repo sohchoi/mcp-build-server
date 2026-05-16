@@ -55,6 +55,7 @@ PORT=8080
 REPOS_BASE_DIR=D:\          # Root folder containing your git repos (e.g. D:\Qoo10DevJP lives here)
 WEBHOOK_SECRET=your-secret  # Any random string — must match what the hook sends
 MAX_BUILDS_PER_REPO=20
+BUILD_SCOPE=all             # all | related
 ```
 
 ### 3. Open Windows Firewall for port 8080
@@ -174,19 +175,19 @@ The server has no per-repo config or repo-specific restrictions.
 
 For each push:
 1. Finds all `.sln` files in the pushed repo
-2. Compares changed files in your branch vs `master` (or `main`)
-3. Builds solutions related to those changed paths
+2. Builds all solutions by default (`BUILD_SCOPE=all`)
+3. Optionally limits to changed-related solutions when `BUILD_SCOPE=related`
 
 ### Build flow details
 
 For each webhook request, the server runs:
-1. `git status --porcelain`
-2. If dirty: `git stash push -u -m "mcp-auto-stash:<timestamp>:<branch>"`
-3. `git fetch origin <branch>`
-4. `git checkout -B <branch> origin/<branch>`
-5. Find all `.sln` files and select related solutions by changed path
-6. `dotnet build <solution>.sln --nologo` for each related solution
-7. If a solution fails with `MSB4051`, auto-repair the missing project GUID in `.sln` and retry that solution once
+1. `git fetch origin <branch>` in canonical repo
+2. Create temporary worktree from `origin/<branch>`
+3. `git checkout -B <branch> origin/<branch>` in temporary worktree
+4. Select solution set by `BUILD_SCOPE` (`all` or `related`)
+5. `dotnet build <solution>.sln --nologo` in temporary worktree
+6. If a solution fails with `MSB4051`, auto-repair `.sln` in temporary worktree and retry once
+7. Cleanup temporary worktree (canonical repo remains unchanged)
 
 ### Important repo-name rule
 
@@ -236,14 +237,12 @@ Once the server is running, ask Copilot CLI:
 - Check the VDI server is running: `curl http://localhost:8080/health`
 
 **Wrong branch built**
-- The server always does `git fetch origin <branch>` + `git checkout -B <branch> origin/<branch>` before building
-- If the VDI repo has uncommitted changes, the server auto-stashes them first (`git stash push -u`) and then switches to the pushed branch
+- The server builds from a temporary worktree checked out from `origin/<branch>`
+- Verify your hook sends the expected branch and the branch exists on origin
 
-**I need my previous uncommitted files after auto-stash**
-- On VDI repo:
-  - `git stash list`
-  - `git stash show -p stash@{0}`
-  - `git stash apply stash@{0}` (or `git stash pop stash@{0}`)
+**Build left unexpected local changes**
+- Build/auto-repair now runs only in temporary worktree and cleans it up
+- If canonical repo still looks dirty, those changes were pre-existing local edits, not from build runner
 
 **Admin.sln GUID error (MSB4051)**
 - A project is referenced in the solution but missing from the `.sln` file
