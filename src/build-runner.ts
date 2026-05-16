@@ -460,10 +460,144 @@ async function runCommand(
   });
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchBranchWithRetry(
+  repoPath: string,
+  branch: string
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  const maxAttempts = Math.max(1, parseInt(process.env.FETCH_BRANCH_MAX_ATTEMPTS ?? '20', 10));
+  const retryDelayMs = Math.max(1000, parseInt(process.env.FETCH_BRANCH_RETRY_DELAY_MS ?? '3000', 10));
+  let allStdout = '';
+  let allStderr = '';
+  let lastCode = 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await runCommand('git', ['fetch', 'origin', branch], repoPath);
+    allStdout += `\n[attempt ${attempt}/${maxAttempts}] git fetch origin ${branch}\n${res.stdout}`;
+    allStderr += res.stderr;
+    lastCode = res.code;
+
+    if (res.code === 0) {
+      return { stdout: allStdout, stderr: allStderr, code: 0 };
+    }
+
+    const text = `${res.stdout}\n${res.stderr}`.toLowerCase();
+    const isMissingRef = text.includes("couldn't find remote ref");
+    if (!isMissingRef || attempt === maxAttempts) {
+      return { stdout: allStdout, stderr: allStderr, code: lastCode };
+    }
+
+    await sleep(retryDelayMs);
+  }
+
+  return { stdout: allStdout, stderr: allStderr, code: lastCode };
+}
+
+async function waitForRemoteBranch(
+  repoPath: string,
+  branch: string
+): Promise<{ stdout: string; stderr: string; code: number; ready: boolean }> {
+  const maxAttempts = Math.max(1, parseInt(process.env.REMOTE_BRANCH_WAIT_ATTEMPTS ?? '60', 10));
+  const retryDelayMs = Math.max(1000, parseInt(process.env.REMOTE_BRANCH_WAIT_DELAY_MS ?? '2000', 10));
+  let allStdout = '';
+  let allStderr = '';
+  let lastCode = 0;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await runCommand('git', ['ls-remote', '--heads', 'origin', branch], repoPath);
+    allStdout += `\n[attempt ${attempt}/${maxAttempts}] git ls-remote --heads origin ${branch}\n${res.stdout}`;
+    allStderr += res.stderr;
+    lastCode = res.code;
+
+    if (res.code !== 0) {
+      return { stdout: allStdout, stderr: allStderr, code: res.code, ready: false };
+    }
+
+    if (res.stdout.trim()) {
+      return { stdout: allStdout, stderr: allStderr, code: 0, ready: true };
+    }
+
+    if (attempt < maxAttempts) {
+      await sleep(retryDelayMs);
+    }
+  }
+
+  return { stdout: allStdout, stderr: allStderr, code: lastCode, ready: false };
+}
+
+async function prepareRepoForBranchSwitch(
+  repoPath: string,
+  targetBranch: string
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  let stdout = '';
+  let stderr = '';
+
+  const currentBranch = await runCommand('git', ['branch', '--show-current'], repoPath);
+  stdout += `=== git branch --show-current ===\n${currentBranch.stdout}`;
+  stderr += currentBranch.stderr;
+  if (currentBranch.code !== 0) {
+    stderr += `\ngit branch --show-current failed with exit code ${currentBranch.code}`;
+    return { stdout, stderr, code: currentBranch.code };
+  }
+  const currentBranchName = currentBranch.stdout.trim();
+
+  const status = await runCommand('git', ['status', '--porcelain'], repoPath);
+  stdout += `\n=== git status --porcelain ===\n${status.stdout}`;
+  stderr += status.stderr;
+  if (status.code !== 0) {
+    stderr += `\ngit status --porcelain failed with exit code ${status.code}`;
+    return { stdout, stderr, code: status.code };
+  }
+
+  if (status.stdout.trim()) {
+    const add = await runCommand('git', ['add', '-A'], repoPath);
+    stdout += `\n=== git add -A ===\n${add.stdout}`;
+    stderr += add.stderr;
+    if (add.code !== 0) {
+      stderr += `\ngit add -A failed with exit code ${add.code}`;
+      return { stdout, stderr, code: add.code };
+    }
+
+    const commitMessage = `[mcp-build-server] auto-commit before switch to ${targetBranch}`;
+    const commit = await runCommand('git', ['commit', '-m', commitMessage], repoPath);
+    stdout += `\n=== git commit (auto) ===\n${commit.stdout}`;
+    stderr += commit.stderr;
+    if (commit.code !== 0) {
+      stderr += `\ngit commit failed with exit code ${commit.code}`;
+      return { stdout, stderr, code: commit.code };
+    }
+  }
+
+  if (currentBranchName && currentBranchName !== targetBranch) {
+    const checkoutExisting = await runCommand('git', ['checkout', targetBranch], repoPath);
+    stdout += `\n=== git checkout ${targetBranch} ===\n${checkoutExisting.stdout}`;
+    stderr += checkoutExisting.stderr;
+    if (checkoutExisting.code !== 0) {
+      const checkoutFromOrigin = await runCommand('git', ['checkout', '-B', targetBranch, `origin/${targetBranch}`], repoPath);
+      stdout += `\n=== git checkout -B ${targetBranch} origin/${targetBranch} ===\n${checkoutFromOrigin.stdout}`;
+      stderr += checkoutFromOrigin.stderr;
+      if (checkoutFromOrigin.code !== 0) {
+        stderr += `\ngit checkout failed with exit code ${checkoutFromOrigin.code}`;
+        return { stdout, stderr, code: checkoutFromOrigin.code };
+      }
+    }
+  }
+
+  return { stdout, stderr, code: 0 };
+}
+
 function createTempWorktreePath(repo: string): string {
-  const base = path.join(os.tmpdir(), 'mcp-build-worktrees');
-  const suffix = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
-  return path.join(base, `${repo}-${suffix}`);
+  const root = path.parse(reposBaseDir()).root;
+  const base =
+    root && /^[A-Za-z]:\\$/.test(root)
+      ? path.join(root, 'wt')
+      : path.join(os.tmpdir(), 'wt');
+  const repoToken = repo.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10) || 'repo';
+  const suffix = `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 6)}`;
+  return path.join(base, `${repoToken}-${suffix}`);
 }
 
 export async function triggerBuild(repo: string, branch: string): Promise<BuildRecord> {
@@ -495,27 +629,62 @@ export async function triggerBuild(repo: string, branch: string): Promise<BuildR
 
   try {
     // Step 1: create temporary worktree for branch build
-    console.log(`[build] git fetch origin ${branch} in ${repoPath}`);
-    const fetch = await runCommand('git', ['fetch', 'origin', branch], repoPath);
-    allOutput += `=== git fetch ===\n${fetch.stdout}`;
-    allError += fetch.stderr;
-    if (fetch.code !== 0) {
+    const longpathsConfig = await runCommand('git', ['config', 'core.longpaths', 'true'], repoPath);
+    allOutput += `=== git config core.longpaths true ===\n${longpathsConfig.stdout}`;
+    allError += longpathsConfig.stderr;
+
+    const waitRemote = await waitForRemoteBranch(repoPath, branch);
+    allOutput += `\n=== wait for remote branch ${branch} ===\n${waitRemote.stdout}`;
+    allError += waitRemote.stderr;
+    if (waitRemote.code !== 0) {
       success = false;
-      allError += `\ngit fetch failed with exit code ${fetch.code}`;
+      allError += `\ngit ls-remote failed with exit code ${waitRemote.code}`;
+    } else if (!waitRemote.ready) {
+      success = false;
+      allError += '\nremote branch did not appear within wait window.';
+    }
+
+    if (success) {
+      console.log(`[build] git fetch origin ${branch} in ${repoPath}`);
+      const fetch = await fetchBranchWithRetry(repoPath, branch);
+      allOutput += `=== git fetch ===\n${fetch.stdout}`;
+      allError += fetch.stderr;
+      if (fetch.code !== 0) {
+        success = false;
+        allError += `\ngit fetch failed with exit code ${fetch.code}. Remote branch may not exist yet (pre-push timing).`;
+      }
+    }
+
+    if (success) {
+      const prepare = await prepareRepoForBranchSwitch(repoPath, branch);
+      allOutput += `\n=== prepare repo for ${branch} ===\n${prepare.stdout}`;
+      allError += prepare.stderr;
+      if (prepare.code !== 0) {
+        success = false;
+        allError += `\nrepo preparation failed with exit code ${prepare.code}`;
+      }
     }
 
     if (success) {
       tempWorktreePath = createTempWorktreePath(repo);
       fs.mkdirSync(path.dirname(tempWorktreePath), { recursive: true });
       console.log(`[build] git worktree add --detach ${tempWorktreePath} origin/${branch}`);
-      const addWorktree = await runCommand('git', ['worktree', 'add', '--detach', tempWorktreePath, `origin/${branch}`], repoPath);
+      const addWorktree = await runCommand(
+        'git',
+        ['-c', 'core.longpaths=true', 'worktree', 'add', '--detach', tempWorktreePath, `origin/${branch}`],
+        repoPath
+      );
       allOutput += `\n=== git worktree add ${branch} ===\n${addWorktree.stdout}`;
       allError += addWorktree.stderr;
       if (addWorktree.code !== 0) {
         success = false;
         allError += `\ngit worktree add failed with exit code ${addWorktree.code}`;
       } else {
-        const checkout = await runCommand('git', ['checkout', '-B', branch, `origin/${branch}`], tempWorktreePath);
+        const checkout = await runCommand(
+          'git',
+          ['-c', 'core.longpaths=true', 'checkout', '-B', branch, `origin/${branch}`],
+          tempWorktreePath
+        );
         allOutput += `\n=== git checkout ${branch} (temp worktree) ===\n${checkout.stdout}`;
         allError += checkout.stderr;
         if (checkout.code !== 0) {

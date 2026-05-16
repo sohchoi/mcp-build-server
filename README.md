@@ -11,7 +11,7 @@ Local Mac/Windows  -->  git push  -->  TFS/Git server
                                             v
                                     VDI (Windows)
                                   mcp-build-server
-                                  git stash (if dirty) + fetch + checkout
+                                  wait remote branch + auto-commit (if dirty) + branch switch
                                   dotnet build (related solutions)
                                             |
                                             v
@@ -55,6 +55,10 @@ PORT=8080
 REPOS_BASE_DIR=D:\          # Root folder containing your git repos (e.g. D:\Qoo10DevJP lives here)
 WEBHOOK_SECRET=your-secret  # Any random string — must match what the hook sends
 MAX_BUILDS_PER_REPO=20
+REMOTE_BRANCH_WAIT_ATTEMPTS=60
+REMOTE_BRANCH_WAIT_DELAY_MS=2000
+FETCH_BRANCH_MAX_ATTEMPTS=20
+FETCH_BRANCH_RETRY_DELAY_MS=3000
 BUILD_SCOPE=all             # all | related
 ```
 
@@ -181,13 +185,17 @@ For each push:
 ### Build flow details
 
 For each webhook request, the server runs:
-1. `git fetch origin <branch>` in canonical repo
-2. Create temporary worktree from `origin/<branch>`
-3. `git checkout -B <branch> origin/<branch>` in temporary worktree
-4. Select solution set by `BUILD_SCOPE` (`all` or `related`)
-5. `dotnet build <solution>.sln --nologo` in temporary worktree
-6. If a solution fails with `MSB4051`, auto-repair `.sln` in temporary worktree and retry once
-7. Cleanup temporary worktree (canonical repo remains unchanged)
+1. Enable long-path handling in canonical repo (`git config core.longpaths true`)
+2. Wait for `origin/<branch>` to become visible (`git ls-remote --heads origin <branch>`, retry window)
+3. `git fetch origin <branch>` in canonical repo (retry on ref-not-found timing race)
+4. If canonical repo is dirty, auto-commit all local changes on the current branch
+5. Switch canonical repo to `<branch>` (`git checkout <branch>` or `git checkout -B <branch> origin/<branch>`)
+6. Create temporary worktree from `origin/<branch>` (short path under `D:\wt\...` on Windows)
+7. `git checkout -B <branch> origin/<branch>` in temporary worktree
+8. Select solution set by `BUILD_SCOPE` (`all` or `related`)
+9. `dotnet build <solution>.sln --nologo` in temporary worktree
+10. If a solution fails with `MSB4051`, auto-repair `.sln` in temporary worktree and retry once
+11. Cleanup temporary worktree
 
 ### Important repo-name rule
 
@@ -239,6 +247,12 @@ Once the server is running, ask Copilot CLI:
 **Wrong branch built**
 - The server builds from a temporary worktree checked out from `origin/<branch>`
 - Verify your hook sends the expected branch and the branch exists on origin
+
+**`couldn't find remote ref <branch>` happens intermittently**
+- This is usually a push/webhook timing race where origin has not exposed the new branch yet
+- Tune `.env` retry window:
+  - `REMOTE_BRANCH_WAIT_ATTEMPTS`, `REMOTE_BRANCH_WAIT_DELAY_MS`
+  - `FETCH_BRANCH_MAX_ATTEMPTS`, `FETCH_BRANCH_RETRY_DELAY_MS`
 
 **Build left unexpected local changes**
 - Build/auto-repair now runs only in temporary worktree and cleans it up
