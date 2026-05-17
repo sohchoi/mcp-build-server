@@ -11,8 +11,8 @@ Local Mac/Windows  -->  git push  -->  TFS/Git server
                                             v
                                     VDI (Windows)
                                   mcp-build-server
-                                  wait remote branch + auto-commit (if dirty) + branch switch
-                                  dotnet build (related solutions)
+                                  wait remote branch + fetch + auto-commit + checkout + pull
+                                  msbuild (each .sln in-place)
                                             |
                                             v
                                GitHub Copilot CLI (MCP tools)
@@ -28,7 +28,7 @@ If VDI is unreachable, the hook prints a warning and push still continues.
 
 ### Prerequisites
 - Node.js 18+ ([nodejs.org](https://nodejs.org))
-- .NET SDK ([dotnet.microsoft.com](https://dotnet.microsoft.com/download))
+- Visual Studio 2022 (any edition — provides MSBuild)
 - Git
 
 ### 1. Clone and install
@@ -60,6 +60,7 @@ REMOTE_BRANCH_WAIT_DELAY_MS=2000
 FETCH_BRANCH_MAX_ATTEMPTS=20
 FETCH_BRANCH_RETRY_DELAY_MS=3000
 BUILD_SCOPE=all             # all | related
+MSBUILD_PATH=               # Leave empty for auto-detect via vswhere
 ```
 
 ### 3. Open Windows Firewall for port 8080
@@ -185,17 +186,16 @@ For each push:
 ### Build flow details
 
 For each webhook request, the server runs:
-1. Enable long-path handling in canonical repo (`git config core.longpaths true`)
+1. Enable long-path handling (`git config core.longpaths true`)
 2. Wait for `origin/<branch>` to become visible (`git ls-remote --heads origin <branch>`, retry window)
-3. `git fetch origin <branch>` in canonical repo (retry on ref-not-found timing race)
-4. If canonical repo is dirty, auto-commit all local changes on the current branch
-5. Switch canonical repo to `<branch>` (`git checkout <branch>` or `git checkout -B <branch> origin/<branch>`)
-6. Create temporary worktree from `origin/<branch>` (short path under `D:\wt\...` on Windows)
-7. `git checkout -B <branch> origin/<branch>` in temporary worktree
-8. Select solution set by `BUILD_SCOPE` (`all` or `related`)
-9. `dotnet build <solution>.sln --nologo` in temporary worktree
-10. If a solution fails with `MSB4051`, auto-repair `.sln` in temporary worktree and retry once
-11. Cleanup temporary worktree
+3. `git fetch origin <branch>` (retry on ref-not-found timing race)
+4. If repo has uncommitted changes, auto-commit them on current branch
+5. Switch repo to `<branch>` (`git checkout` or `git checkout -B <branch> origin/<branch>`)
+6. `git pull origin <branch>` to sync working tree
+7. Select solution set by `BUILD_SCOPE` (`all` or `related`)
+8. `msbuild <solution>.sln /nologo /m /restore` for each solution (parallel build, NuGet restore)
+
+Builds run in-place in the canonical repo (no temporary worktrees or copies).
 
 ### Important repo-name rule
 
@@ -245,7 +245,7 @@ Once the server is running, ask Copilot CLI:
 - Check the VDI server is running: `curl http://localhost:8080/health`
 
 **Wrong branch built**
-- The server builds from a temporary worktree checked out from `origin/<branch>`
+- The server builds in-place in the canonical repo after checking out the target branch
 - Verify your hook sends the expected branch and the branch exists on origin
 
 **`couldn't find remote ref <branch>` happens intermittently**
@@ -255,18 +255,6 @@ Once the server is running, ask Copilot CLI:
   - `FETCH_BRANCH_MAX_ATTEMPTS`, `FETCH_BRANCH_RETRY_DELAY_MS`
 
 **Build left unexpected local changes**
-- Build/auto-repair now runs only in temporary worktree and cleans it up
-- If canonical repo still looks dirty, those changes were pre-existing local edits, not from build runner
-
-**Admin.sln GUID error (MSB4051)**
-- A project is referenced in the solution but missing from the `.sln` file
-- The server now tries to auto-fix this by adding the missing project entry and retrying once
-- If the GUID does not exist in any `.csproj`, the server removes dangling `ProjectDependencies` entry for that missing GUID and retries once
-- If auto-repair still fails, check whether the missing GUID exists in any `.csproj` `<ProjectGuid>` under the repo
-- If not found, add/fix the project manually in the solution and push again
-
-**MSB4019 missing `Microsoft.WebApplication.targets`**
-- This means the machine is missing a usable Visual Studio WebApplication targets path for the project type
-- The server now auto-retries with a detected `VSToolsPath` when this error appears
-- If your environment is custom, set `VSTOOLS_PATH` in `.env` explicitly (example: `C:\Program Files (x86)\MSBuild\Microsoft\VisualStudio\v17.0`)
+- Builds now run in-place in the canonical repo — the repo stays on the built branch after completion
+- Any uncommitted changes are auto-committed before branch switch
 
