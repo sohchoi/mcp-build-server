@@ -61,7 +61,7 @@ export function registerTools(server: McpServer): void {
   server.registerTool(
     'trigger_build',
     {
-      description: 'Manually trigger a git pull + dotnet build for a repository',
+      description: 'Manually trigger a git pull + msbuild for a repository',
       inputSchema: z.object({
         repo: z.string().describe('Repository directory name under REPOS_BASE_DIR'),
         branch: z.string().optional().describe('Branch to pull (defaults to "main")'),

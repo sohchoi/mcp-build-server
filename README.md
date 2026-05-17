@@ -59,7 +59,7 @@ REMOTE_BRANCH_WAIT_ATTEMPTS=60
 REMOTE_BRANCH_WAIT_DELAY_MS=2000
 FETCH_BRANCH_MAX_ATTEMPTS=20
 FETCH_BRANCH_RETRY_DELAY_MS=3000
-BUILD_SCOPE=all             # all | related
+BUILD_SCOPE=related         # related (recommended) | all
 MSBUILD_PATH=               # Leave empty for auto-detect via vswhere
 ```
 
@@ -176,12 +176,10 @@ Invoke-WebRequest -Uri "http://<VDI_IP>:8080/hook-content" -OutFile ".git\hooks\
 
 ## Build selection
 
-The server has no per-repo config or repo-specific restrictions.
-
 For each push:
 1. Finds all `.sln` files in the pushed repo
-2. Builds all solutions by default (`BUILD_SCOPE=all`)
-3. Optionally limits to changed-related solutions when `BUILD_SCOPE=related`
+2. **Recommended:** Set `BUILD_SCOPE=related` to build only solutions whose directories contain changed files — this avoids failing on unrelated broken `.sln` files
+3. `BUILD_SCOPE=all` builds every `.sln` in the repo (may fail if any solution has missing projects)
 
 ### Build flow details
 
@@ -229,7 +227,9 @@ Once the server is running, ask Copilot CLI:
 | `GET /health` | Server health check |
 | `POST /webhook` | Receives push notifications from the pre-push hook |
 | `GET /hook-content` | Returns the pre-push hook script (pipe to a file to install) |
-| `GET /mcp` / `POST /mcp` | MCP protocol endpoint |
+| `POST /mcp` | MCP protocol endpoint (Streamable HTTP) |
+| `GET /mcp` | MCP protocol endpoint (GET) |
+| `DELETE /mcp` | MCP protocol endpoint (session cleanup) |
 
 ---
 
